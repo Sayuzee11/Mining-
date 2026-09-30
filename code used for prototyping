@@ -1,0 +1,775 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// =====================================================
+// WIFI
+// =====================================================
+
+#define WIFI_SSID     "YOUR_WIFI_NAME"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+
+// ESP32 local access point
+#define AP_SSID       "MineGroundMonitor"
+#define AP_PASSWORD   "12345678"
+
+// =====================================================
+// TELEGRAM
+// =====================================================
+
+// Paste your NEW BotFather token here.
+// DO NOT share it with anyone.
+#define BOT_TOKEN "PASTE_YOUR_NEW_BOT_TOKEN_HERE"
+
+// Mine Alert System group ID
+#define CHAT_ID "-5322708418"
+
+WiFiClientSecure telegramClient;
+UniversalTelegramBot bot(BOT_TOKEN, telegramClient);
+
+// =====================================================
+// PINS
+// =====================================================
+
+#define SDA_PIN 8
+#define SCL_PIN 9
+
+#define VIBRATION_PIN 4
+
+// =====================================================
+// OBJECTS
+// =====================================================
+
+Adafruit_MPU6050 mpu;
+WebServer server(80);
+
+// =====================================================
+// SENSOR VARIABLES
+// =====================================================
+
+float pitch = 0;
+float roll = 0;
+
+float pitchOffset = 0;
+float rollOffset = 0;
+
+float groundTilt = 0;
+float previousTilt = 0;
+float tiltRate = 0;
+
+float vibrationPercent = 0;
+float riskScore = 0;
+
+String groundStatus = "SAFE";
+
+// =====================================================
+// TELEGRAM ALERT VARIABLES
+// =====================================================
+
+int criticalCount = 0;
+
+const int CRITICAL_COUNT_REQUIRED = 5;
+
+bool criticalAlertSent = false;
+
+// =====================================================
+// TIMING
+// =====================================================
+
+unsigned long previousSensorTime = 0;
+
+const unsigned long SENSOR_INTERVAL = 200;
+
+// =====================================================
+// CALIBRATION
+// =====================================================
+
+void calibrateMPU()
+{
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("MPU6050 CALIBRATION");
+  Serial.println("Keep the sensor completely still.");
+  Serial.println("================================");
+
+  delay(2000);
+
+  float pitchSum = 0;
+  float rollSum = 0;
+
+  const int samples = 100;
+
+  for (int i = 0; i < samples; i++)
+  {
+    sensors_event_t a, g, temp;
+
+    mpu.getEvent(&a, &g, &temp);
+
+    float p = atan2(
+      a.acceleration.y,
+      sqrt(
+        a.acceleration.x * a.acceleration.x +
+        a.acceleration.z * a.acceleration.z
+      )
+    ) * 180.0 / PI;
+
+    float r = atan2(
+      -a.acceleration.x,
+      a.acceleration.z
+    ) * 180.0 / PI;
+
+    pitchSum += p;
+    rollSum += r;
+
+    delay(20);
+  }
+
+  pitchOffset = pitchSum / samples;
+  rollOffset = rollSum / samples;
+
+  Serial.println("Calibration complete.");
+
+  Serial.print("Pitch Offset: ");
+  Serial.println(pitchOffset);
+
+  Serial.print("Roll Offset: ");
+  Serial.println(rollOffset);
+
+  Serial.println();
+}
+
+// =====================================================
+// READ MPU6050
+// =====================================================
+
+void readMPU()
+{
+  sensors_event_t a, g, temp;
+
+  mpu.getEvent(&a, &g, &temp);
+
+  float rawPitch = atan2(
+    a.acceleration.y,
+    sqrt(
+      a.acceleration.x * a.acceleration.x +
+      a.acceleration.z * a.acceleration.z
+    )
+  ) * 180.0 / PI;
+
+  float rawRoll = atan2(
+    -a.acceleration.x,
+    a.acceleration.z
+  ) * 180.0 / PI;
+
+  pitch = rawPitch - pitchOffset;
+  roll = rawRoll - rollOffset;
+
+  groundTilt = sqrt(
+    pitch * pitch +
+    roll * roll
+  );
+}
+
+// =====================================================
+// READ VIBRATION
+// =====================================================
+
+void readVibration()
+{
+  int vibrationCount = 0;
+
+  const int samples = 100;
+
+  for (int i = 0; i < samples; i++)
+  {
+    if (digitalRead(VIBRATION_PIN) == HIGH)
+    {
+      vibrationCount++;
+    }
+
+    delay(1);
+  }
+
+  vibrationPercent =
+    ((float)vibrationCount / samples) * 100.0;
+
+  if (vibrationPercent > 100)
+    vibrationPercent = 100;
+
+  if (vibrationPercent < 0)
+    vibrationPercent = 0;
+}
+
+// =====================================================
+// CALCULATE TILT RATE
+// =====================================================
+
+void calculateTiltRate(float dt)
+{
+  if (dt <= 0)
+    return;
+
+  tiltRate =
+    abs(groundTilt - previousTilt) / dt;
+
+  previousTilt = groundTilt;
+}
+
+// =====================================================
+// CALCULATE RISK
+// =====================================================
+
+void calculateRisk()
+{
+  // ---------------------------------------------
+  // Tilt score
+  // 5 degrees = 100%
+  // ---------------------------------------------
+
+  float tiltScore =
+    (groundTilt / 5.0) * 100.0;
+
+  tiltScore =
+    constrain(tiltScore, 0, 100);
+
+  // ---------------------------------------------
+  // Vibration score
+  // ---------------------------------------------
+
+  float vibrationScore =
+    vibrationPercent;
+
+  // ---------------------------------------------
+  // Tilt-rate score
+  // 1 degree/sec = 100%
+  // ---------------------------------------------
+
+  float tiltRateScore =
+    (tiltRate / 1.0) * 100.0;
+
+  tiltRateScore =
+    constrain(tiltRateScore, 0, 100);
+
+  // ---------------------------------------------
+  // Combined risk
+  // ---------------------------------------------
+
+  riskScore =
+    (0.45 * tiltScore) +
+    (0.35 * vibrationScore) +
+    (0.20 * tiltRateScore);
+
+  riskScore =
+    constrain(riskScore, 0, 100);
+
+  // ---------------------------------------------
+  // Status
+  // ---------------------------------------------
+
+  if (riskScore < 30)
+  {
+    groundStatus = "SAFE";
+  }
+  else if (riskScore < 60)
+  {
+    groundStatus = "CAUTION";
+  }
+  else if (riskScore < 80)
+  {
+    groundStatus = "WARNING";
+  }
+  else
+  {
+    groundStatus = "CRITICAL";
+  }
+}
+
+// =====================================================
+// TELEGRAM CRITICAL ALERT
+// =====================================================
+
+void checkTelegramAlert()
+{
+  // CRITICAL condition
+  if (riskScore >= 80)
+  {
+    criticalCount++;
+
+    Serial.print("Critical count: ");
+    Serial.println(criticalCount);
+
+    // Require several consecutive critical readings
+    if (
+      criticalCount >= CRITICAL_COUNT_REQUIRED &&
+      !criticalAlertSent
+    )
+    {
+      String message = "";
+
+      message += "🚨 CRITICAL GROUND ALERT 🚨\n\n";
+
+      message += "Possible ground instability detected.\n\n";
+
+      message += "Ground Tilt: ";
+      message += String(groundTilt, 2);
+      message += "°\n";
+
+      message += "Vibration: ";
+      message += String(vibrationPercent, 1);
+      message += "%\n";
+
+      message += "Tilt Rate: ";
+      message += String(tiltRate, 2);
+      message += " °/s\n";
+
+      message += "Risk Score: ";
+      message += String(riskScore, 1);
+      message += "/100\n\n";
+
+      message += "STATUS: CRITICAL";
+
+      bool sent =
+        bot.sendMessage(
+          CHAT_ID,
+          message,
+          ""
+        );
+
+      if (sent)
+      {
+        Serial.println("================================");
+        Serial.println("TELEGRAM CRITICAL ALERT SENT!");
+        Serial.println("================================");
+
+        criticalAlertSent = true;
+      }
+      else
+      {
+        Serial.println("Telegram alert failed.");
+      }
+    }
+  }
+  else
+  {
+    // Reset consecutive critical counter
+    criticalCount = 0;
+  }
+
+  // Re-arm the system after risk falls below WARNING
+  if (riskScore < 60)
+  {
+    criticalAlertSent = false;
+  }
+}
+
+// =====================================================
+// WEB DASHBOARD
+// =====================================================
+
+void handleRoot()
+{
+  String html = "";
+
+  html += "<!DOCTYPE html>";
+  html += "<html>";
+  html += "<head>";
+
+  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+
+  html += "<meta http-equiv='refresh' content='1'>";
+
+  html += "<title>Mine Ground Monitor</title>";
+
+  html += "<style>";
+
+  html += "body{";
+  html += "font-family:Arial;";
+  html += "background:#111;";
+  html += "color:white;";
+  html += "text-align:center;";
+  html += "margin:0;";
+  html += "padding:20px;";
+  html += "}";
+
+  html += ".container{";
+  html += "max-width:700px;";
+  html += "margin:auto;";
+  html += "}";
+
+  html += ".card{";
+  html += "background:#222;";
+  html += "padding:20px;";
+  html += "margin:12px;";
+  html += "border-radius:15px;";
+  html += "}";
+
+  html += ".value{";
+  html += "font-size:32px;";
+  html += "font-weight:bold;";
+  html += "}";
+
+  html += ".status{";
+  html += "font-size:35px;";
+  html += "font-weight:bold;";
+  html += "}";
+
+  html += "</style>";
+
+  html += "</head>";
+
+  html += "<body>";
+
+  html += "<div class='container'>";
+
+  html += "<h1>⛏️ Mine Ground Monitor</h1>";
+
+  // Pitch
+  html += "<div class='card'>";
+  html += "<h2>Pitch</h2>";
+  html += "<div class='value'>";
+  html += String(pitch, 2);
+  html += " °</div>";
+  html += "</div>";
+
+  // Roll
+  html += "<div class='card'>";
+  html += "<h2>Roll</h2>";
+  html += "<div class='value'>";
+  html += String(roll, 2);
+  html += " °</div>";
+  html += "</div>";
+
+  // Ground tilt
+  html += "<div class='card'>";
+  html += "<h2>Ground Tilt</h2>";
+  html += "<div class='value'>";
+  html += String(groundTilt, 2);
+  html += " °</div>";
+  html += "</div>";
+
+  // Tilt rate
+  html += "<div class='card'>";
+  html += "<h2>Tilt Rate</h2>";
+  html += "<div class='value'>";
+  html += String(tiltRate, 2);
+  html += " °/s</div>";
+  html += "</div>";
+
+  // Vibration
+  html += "<div class='card'>";
+  html += "<h2>Vibration</h2>";
+  html += "<div class='value'>";
+  html += String(vibrationPercent, 1);
+  html += " %</div>";
+  html += "</div>";
+
+  // Risk
+  html += "<div class='card'>";
+  html += "<h2>Risk Score</h2>";
+  html += "<div class='value'>";
+  html += String(riskScore, 1);
+  html += " / 100</div>";
+  html += "</div>";
+
+  // Status
+  html += "<div class='card'>";
+  html += "<h2>Ground Status</h2>";
+  html += "<div class='status'>";
+  html += groundStatus;
+  html += "</div>";
+  html += "</div>";
+
+  html += "<p>Automatic monitoring active</p>";
+
+  html += "</div>";
+
+  html += "</body>";
+
+  html += "</html>";
+
+  server.send(
+    200,
+    "text/html",
+    html
+  );
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  delay(1000);
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("MINE GROUND MONITOR");
+  Serial.println("================================");
+
+  // -------------------------------------------------
+  // I2C
+  // -------------------------------------------------
+
+  Wire.begin(
+    SDA_PIN,
+    SCL_PIN
+  );
+
+  // -------------------------------------------------
+  // MPU6050
+  // -------------------------------------------------
+
+  if (!mpu.begin())
+  {
+    Serial.println("MPU6050 NOT FOUND!");
+
+    while (1)
+    {
+      delay(1000);
+    }
+  }
+
+  Serial.println("MPU6050 connected.");
+
+  // MPU configuration
+  mpu.setAccelerometerRange(
+    MPU6050_RANGE_8_G
+  );
+
+  mpu.setGyroRange(
+    MPU6050_RANGE_500_DEG
+  );
+
+  mpu.setFilterBandwidth(
+    MPU6050_BAND_21_HZ
+  );
+
+  // -------------------------------------------------
+  // VIBRATION SENSOR
+  // -------------------------------------------------
+
+  pinMode(
+    VIBRATION_PIN,
+    INPUT
+  );
+
+  // -------------------------------------------------
+  // CALIBRATION
+  // -------------------------------------------------
+
+  calibrateMPU();
+
+  // -------------------------------------------------
+  // WIFI
+  // -------------------------------------------------
+
+  WiFi.mode(WIFI_AP_STA);
+
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
+
+  Serial.print("Connecting to WiFi");
+
+  unsigned long wifiStart =
+    millis();
+
+  while (
+    WiFi.status() != WL_CONNECTED &&
+    millis() - wifiStart < 15000
+  )
+  {
+    delay(500);
+
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println("WiFi connected.");
+
+    Serial.print("WiFi IP: ");
+    Serial.println(
+      WiFi.localIP()
+    );
+  }
+  else
+  {
+    Serial.println(
+      "WiFi connection failed."
+    );
+
+    Serial.println(
+      "Telegram will not work until internet is available."
+    );
+  }
+
+  // -------------------------------------------------
+  // ESP32 ACCESS POINT
+  // -------------------------------------------------
+
+  WiFi.softAP(
+    AP_SSID,
+    AP_PASSWORD
+  );
+
+  Serial.println();
+  Serial.println("ESP32 Access Point started.");
+
+  Serial.print("AP Name: ");
+  Serial.println(AP_SSID);
+
+  Serial.print("AP IP: ");
+  Serial.println(
+    WiFi.softAPIP()
+  );
+
+  // -------------------------------------------------
+  // TELEGRAM HTTPS
+  // -------------------------------------------------
+
+  telegramClient.setInsecure();
+
+  // -------------------------------------------------
+  // TELEGRAM STARTUP MESSAGE
+  // -------------------------------------------------
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    bool sent =
+      bot.sendMessage(
+        CHAT_ID,
+        "✅ Mine Ground Monitor is ONLINE.\n\nSensor monitoring has started.",
+        ""
+      );
+
+    if (sent)
+    {
+      Serial.println(
+        "Telegram startup message sent."
+      );
+    }
+    else
+    {
+      Serial.println(
+        "Telegram startup message failed."
+      );
+    }
+  }
+
+  // -------------------------------------------------
+  // WEB SERVER
+  // -------------------------------------------------
+
+  server.on(
+    "/",
+    handleRoot
+  );
+
+  server.begin();
+
+  Serial.println(
+    "Web server started."
+  );
+
+  Serial.println();
+  Serial.println(
+    "================================"
+  );
+
+  Serial.print(
+    "Dashboard: http://"
+  );
+
+  Serial.println(
+    WiFi.softAPIP()
+  );
+
+  Serial.println(
+    "================================"
+  );
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+  server.handleClient();
+
+  unsigned long currentTime =
+    millis();
+
+  if (
+    currentTime - previousSensorTime
+    >= SENSOR_INTERVAL
+  )
+  {
+    float dt =
+      (currentTime - previousSensorTime)
+      / 1000.0;
+
+    previousSensorTime =
+      currentTime;
+
+    // -----------------------------------------------
+    // Read sensors
+    // -----------------------------------------------
+
+    readMPU();
+
+    readVibration();
+
+    // -----------------------------------------------
+    // Calculate tilt rate
+    // -----------------------------------------------
+
+    calculateTiltRate(dt);
+
+    // -----------------------------------------------
+    // Calculate risk
+    // -----------------------------------------------
+
+    calculateRisk();
+
+    // -----------------------------------------------
+    // Telegram alert
+    // -----------------------------------------------
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      checkTelegramAlert();
+    }
+
+    // -----------------------------------------------
+    // Serial monitor
+    // -----------------------------------------------
+
+    Serial.print("Tilt: ");
+    Serial.print(groundTilt, 2);
+
+    Serial.print(" | Vibration: ");
+    Serial.print(vibrationPercent, 1);
+
+    Serial.print("% | Tilt Rate: ");
+    Serial.print(tiltRate, 2);
+
+    Serial.print(" | Risk: ");
+    Serial.print(riskScore, 1);
+
+    Serial.print(" | Status: ");
+    Serial.println(groundStatus);
+  }
+}
